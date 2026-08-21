@@ -93,4 +93,233 @@ app.post("/release-gate", (req, res) => {
   res.json(evaluateReleaseGate(req.body));
 });
 
+function hasExactKeys(obj, keys) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    return false;
+  }
+
+  const actual = Object.keys(obj).sort();
+  const expected = [...keys].sort();
+
+  return JSON.stringify(actual) === JSON.stringify(expected);
+}
+
+function isString(value) {
+  return typeof value === "string";
+}
+
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isValidTopLevelPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return false;
+  }
+
+  const allowedKeys = [
+    "provenance",
+    "humanApproved",
+    "untrustedContent",
+    "action"
+  ];
+
+  for (const key of Object.keys(payload)) {
+    if (!allowedKeys.includes(key)) {
+      return false;
+    }
+  }
+
+  if (!(payload.provenance === "trusted" || payload.provenance === "untrusted")) {
+    return false;
+  }
+
+  if (typeof payload.humanApproved !== "boolean") {
+    return false;
+  }
+
+  if (
+    "untrustedContent" in payload &&
+    typeof payload.untrustedContent !== "string"
+  ) {
+    return false;
+  }
+
+  if (
+    !payload.action ||
+    typeof payload.action !== "object" ||
+    Array.isArray(payload.action)
+  ) {
+    return false;
+  }
+
+  if (!hasExactKeys(payload.action, ["tool", "args"])) {
+    return false;
+  }
+
+  if (typeof payload.action.tool !== "string") {
+    return false;
+  }
+
+  if (
+    !payload.action.args ||
+    typeof payload.action.args !== "object" ||
+    Array.isArray(payload.action.args)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function isUnsafeHtml(html) {
+  const lower = html.toLowerCase();
+
+  if (/<\s*script\b/i.test(html)) {
+    return true;
+  }
+
+  if (/<\s*iframe\b/i.test(html)) {
+    return true;
+  }
+
+  if (/\son[a-z]+\s*=/i.test(html)) {
+    return true;
+  }
+
+  if (/javascript\s*:/i.test(lower)) {
+    return true;
+  }
+
+  return false;
+}
+
+export function evaluateActionFirewall(payload) {
+  if (!isValidTopLevelPayload(payload)) {
+    return {
+      decision: "block",
+      reason: "INVALID_SCHEMA"
+    };
+  }
+
+  const { humanApproved, action } = payload;
+  const { tool, args } = action;
+
+  const allowedTools = ["search", "lookup_record", "send_email", "render_html"];
+
+  if (!allowedTools.includes(tool)) {
+    return {
+      decision: "block",
+      reason: "TOOL_NOT_ALLOWED"
+    };
+  }
+
+  if (tool === "search") {
+    if (!hasExactKeys(args, ["query"])) {
+      return {
+        decision: "block",
+        reason: "INVALID_SCHEMA"
+      };
+    }
+
+    if (!isString(args.query) || args.query.length < 1 || args.query.length > 200) {
+      return {
+        decision: "block",
+        reason: "INVALID_SCHEMA"
+      };
+    }
+  }
+
+  if (tool === "lookup_record") {
+    if (!hasExactKeys(args, ["tenantId", "recordId"])) {
+      return {
+        decision: "block",
+        reason: "INVALID_SCHEMA"
+      };
+    }
+
+    if (!isString(args.tenantId) || !isNonEmptyString(args.recordId)) {
+      return {
+        decision: "block",
+        reason: "INVALID_SCHEMA"
+      };
+    }
+
+    if (args.tenantId !== "tenant-60b8cdd") {
+      return {
+        decision: "block",
+        reason: "TENANT_SCOPE"
+      };
+    }
+  }
+
+  if (tool === "send_email") {
+    if (!hasExactKeys(args, ["to", "subject", "body"])) {
+      return {
+        decision: "block",
+        reason: "INVALID_SCHEMA"
+      };
+    }
+
+    if (!isString(args.to) || !isString(args.subject) || !isString(args.body)) {
+      return {
+        decision: "block",
+        reason: "INVALID_SCHEMA"
+      };
+    }
+
+    const parts = args.to.split("@");
+
+    if (
+      parts.length !== 2 ||
+      parts[0].length === 0 ||
+      parts[1] !== "notify-lqm4v0r.example"
+    ) {
+      return {
+        decision: "block",
+        reason: "EGRESS_DENIED"
+      };
+    }
+
+    if (humanApproved !== true) {
+      return {
+        decision: "block",
+        reason: "APPROVAL_REQUIRED"
+      };
+    }
+  }
+
+  if (tool === "render_html") {
+    if (!hasExactKeys(args, ["html"])) {
+      return {
+        decision: "block",
+        reason: "INVALID_SCHEMA"
+      };
+    }
+
+    if (!isString(args.html)) {
+      return {
+        decision: "block",
+        reason: "INVALID_SCHEMA"
+      };
+    }
+
+    if (isUnsafeHtml(args.html)) {
+      return {
+        decision: "block",
+        reason: "UNSAFE_OUTPUT"
+      };
+    }
+  }
+
+  return {
+    decision: "allow",
+    reason: "ALLOW"
+  };
+}
+
+app.post("/action-firewall", (req, res) => {
+  res.json(evaluateActionFirewall(req.body));
+});
+
 export default app;
