@@ -530,4 +530,290 @@ app.post("/terraform/plan", (req, res) => {
   res.json(evaluateTerraformPlan(req.body));
 });
 
+const SANITIZE_ALLOWED_HOSTS = new Set([
+  "cdn-p9ieybp.example",
+  "app-0b0n0ti.example"
+]);
+
+const SANITIZE_CHANNELS = new Set([
+  "html",
+  "markdown",
+  "url",
+  "sql",
+  "shell"
+]);
+
+function sanitizeIsObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function sanitizeDecodePercentOnce(input) {
+  try {
+    return decodeURIComponent(input);
+  } catch {
+    return input.replace(/%([0-9a-fA-F]{2})/g, (_, hex) =>
+      String.fromCharCode(parseInt(hex, 16))
+    );
+  }
+}
+
+function sanitizeDecodeHtmlEntitiesOnce(input) {
+  return input
+    .replace(/&#x([0-9a-fA-F]+);?/g, (_, hex) =>
+      String.fromCodePoint(parseInt(hex, 16))
+    )
+    .replace(/&#([0-9]+);?/g, (_, num) =>
+      String.fromCodePoint(parseInt(num, 10))
+    )
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&apos;/gi, "'")
+    .replace(/&#39;/gi, "'")
+    .replace(/&amp;/gi, "&");
+}
+
+function sanitizeDecodeUnicodeEscapesOnce(input) {
+  return input.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
+    String.fromCharCode(parseInt(hex, 16))
+  );
+}
+
+function sanitizeDecodeOnce(input) {
+  let decoded = sanitizeDecodePercentOnce(input);
+  decoded = sanitizeDecodeHtmlEntitiesOnce(decoded);
+  decoded = sanitizeDecodeUnicodeEscapesOnce(decoded);
+  return decoded;
+}
+
+function sanitizeHasDangerousSchemeText(text) {
+  return /\b(?:javascript|data|vbscript)\s*:/i.test(text);
+}
+
+function sanitizeExtractHtmlUrls(text) {
+  const urls = [];
+  const regex = /\b(?:src|href)\s*=\s*(["'])(.*?)\1/gi;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    urls.push(match[2]);
+  }
+
+  return urls;
+}
+
+function sanitizeExtractMarkdownUrls(text) {
+  const urls = [];
+  const regex = /!?\[[^\]]*\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    urls.push(match[1]);
+  }
+
+  return urls;
+}
+
+function sanitizeExtractUrls(channel, text) {
+  if (channel === "html") {
+    return sanitizeExtractHtmlUrls(text);
+  }
+
+  if (channel === "markdown") {
+    return sanitizeExtractMarkdownUrls(text);
+  }
+
+  if (channel === "url") {
+    return [text.trim()];
+  }
+
+  return [];
+}
+
+function sanitizeUrlHasBadScheme(rawUrl) {
+  const value = rawUrl.trim();
+
+  if (value.startsWith("//")) {
+    return false;
+  }
+
+  const schemeMatch = value.match(/^([a-zA-Z][a-zA-Z0-9+.-]*)\s*:/);
+
+  if (!schemeMatch) {
+    return false;
+  }
+
+  const scheme = schemeMatch[1].toLowerCase();
+
+  return scheme !== "http" && scheme !== "https";
+}
+
+function sanitizeParsedHostname(rawUrl) {
+  const value = rawUrl.trim();
+
+  if (value.length === 0) {
+    return null;
+  }
+
+  try {
+    if (value.startsWith("//")) {
+      return new URL(`https:${value}`).hostname;
+    }
+
+    const schemeMatch = value.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+
+    if (!schemeMatch) {
+      return null;
+    }
+
+    const scheme = schemeMatch[1].toLowerCase();
+
+    if (scheme !== "http" && scheme !== "https") {
+      return null;
+    }
+
+    return new URL(value).hostname;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeCheckDangerousScheme(channel, text) {
+  if (sanitizeHasDangerousSchemeText(text)) {
+    return true;
+  }
+
+  const urls = sanitizeExtractUrls(channel, text);
+
+  for (const rawUrl of urls) {
+    if (sanitizeUrlHasBadScheme(rawUrl)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function sanitizeCheckExternalExfil(channel, text) {
+  const urls = sanitizeExtractUrls(channel, text);
+
+  for (const rawUrl of urls) {
+    const hostname = sanitizeParsedHostname(rawUrl);
+
+    if (hostname !== null && !SANITIZE_ALLOWED_HOSTS.has(hostname)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function sanitizeCheckChannelRules(channel, output) {
+  if (channel === "html") {
+    if (/<\s*(?:script|iframe|object|embed)\b/i.test(output)) {
+      return "SCRIPT_TAG";
+    }
+
+    if (/\son[a-zA-Z]+\s*=/i.test(output)) {
+      return "EVENT_HANDLER";
+    }
+
+    if (sanitizeCheckDangerousScheme(channel, output)) {
+      return "DANGEROUS_SCHEME";
+    }
+
+    if (sanitizeCheckExternalExfil(channel, output)) {
+      return "EXTERNAL_EXFIL";
+    }
+  }
+
+  if (channel === "markdown") {
+    if (sanitizeCheckDangerousScheme(channel, output)) {
+      return "DANGEROUS_SCHEME";
+    }
+
+    if (sanitizeCheckExternalExfil(channel, output)) {
+      return "EXTERNAL_EXFIL";
+    }
+  }
+
+  if (channel === "url") {
+    if (sanitizeCheckDangerousScheme(channel, output)) {
+      return "DANGEROUS_SCHEME";
+    }
+
+    if (sanitizeCheckExternalExfil(channel, output)) {
+      return "EXTERNAL_EXFIL";
+    }
+  }
+
+  if (channel === "sql") {
+    if (/['";]|--|\/\*|\bunion\b|\bor\s+1\s*=\s*1\b/i.test(output)) {
+      return "SQL_METACHAR";
+    }
+  }
+
+  if (channel === "shell") {
+    if (/[;&|`<>]|\$\(|\$\{/.test(output)) {
+      return "SHELL_METACHAR";
+    }
+  }
+
+  return "SAFE";
+}
+
+export function evaluateSanitizeOutput(payload) {
+  if (!sanitizeIsObject(payload)) {
+    return {
+      safe: false,
+      reason: "INVALID_SCHEMA"
+    };
+  }
+
+  if (!SANITIZE_CHANNELS.has(payload.channel)) {
+    return {
+      safe: false,
+      reason: "INVALID_SCHEMA"
+    };
+  }
+
+  if (typeof payload.output !== "string") {
+    return {
+      safe: false,
+      reason: "INVALID_SCHEMA"
+    };
+  }
+
+  if (payload.output.length > 20000) {
+    return {
+      safe: false,
+      reason: "INVALID_SCHEMA"
+    };
+  }
+
+  const decoded = sanitizeDecodeOnce(payload.output);
+
+  if (decoded !== payload.output) {
+    const decodedReason = sanitizeCheckChannelRules(payload.channel, decoded);
+
+    if (decodedReason !== "SAFE") {
+      return {
+        safe: false,
+        reason: "ENCODED_PAYLOAD"
+      };
+    }
+  }
+
+  const reason = sanitizeCheckChannelRules(payload.channel, payload.output);
+
+  return {
+    safe: reason === "SAFE",
+    reason
+  };
+}
+
+app.post("/sanitize-output", (req, res) => {
+  res.json(evaluateSanitizeOutput(req.body));
+});
+
 export default app;
