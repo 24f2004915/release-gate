@@ -322,4 +322,212 @@ app.post("/action-firewall", (req, res) => {
   res.json(evaluateActionFirewall(req.body));
 });
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOnlyKeys(obj, keys) {
+  if (!isPlainObject(obj)) {
+    return false;
+  }
+
+  const actual = Object.keys(obj).sort();
+  const expected = [...keys].sort();
+
+  return JSON.stringify(actual) === JSON.stringify(expected);
+}
+
+function isValidTerraformPlanShape(payload) {
+  if (!hasOnlyKeys(payload, [
+    "environment",
+    "state",
+    "providerVersion",
+    "destroyApproved",
+    "resource"
+  ])) {
+    return false;
+  }
+
+  if (typeof payload.environment !== "string") {
+    return false;
+  }
+
+  if (!hasOnlyKeys(payload.state, ["backend", "locked"])) {
+    return false;
+  }
+
+  if (typeof payload.state.backend !== "string") {
+    return false;
+  }
+
+  if (typeof payload.state.locked !== "boolean") {
+    return false;
+  }
+
+  if (typeof payload.providerVersion !== "string") {
+    return false;
+  }
+
+  if (typeof payload.destroyApproved !== "boolean") {
+    return false;
+  }
+
+  const resource = payload.resource;
+
+  if (!hasOnlyKeys(resource, [
+    "address",
+    "type",
+    "action",
+    "labels",
+    "secret",
+    "forceDestroy"
+  ])) {
+    return false;
+  }
+
+  if (typeof resource.address !== "string") {
+    return false;
+  }
+
+  if (typeof resource.type !== "string") {
+    return false;
+  }
+
+  if (!["create", "update", "delete"].includes(resource.action)) {
+    return false;
+  }
+
+  if (!isPlainObject(resource.labels)) {
+    return false;
+  }
+
+  for (const [key, value] of Object.entries(resource.labels)) {
+    if (typeof key !== "string" || typeof value !== "string") {
+      return false;
+    }
+  }
+
+  if (
+    resource.secret !== null &&
+    typeof resource.secret !== "string"
+  ) {
+    return false;
+  }
+
+  if (typeof resource.forceDestroy !== "boolean") {
+    return false;
+  }
+
+  return true;
+}
+
+export function evaluateTerraformPlan(payload) {
+  // 1. Schema and value types
+  if (!isValidTerraformPlanShape(payload)) {
+    return {
+      decision: "reject",
+      reason: "INVALID_PLAN"
+    };
+  }
+
+  const { environment, state, providerVersion, destroyApproved, resource } = payload;
+
+  // 2. Environment
+  if (environment !== "prod-mxingx") {
+    return {
+      decision: "reject",
+      reason: "ENVIRONMENT_MISMATCH"
+    };
+  }
+
+  // 3. Remote state and locking
+  const allowedBackends = ["gcs", "s3", "azurerm", "remote"];
+
+  if (!allowedBackends.includes(state.backend) || state.locked !== true) {
+    return {
+      decision: "reject",
+      reason: "STATE_UNSAFE"
+    };
+  }
+
+  // 4. Provider pinning
+  const exactVersionRegex = /^(= )?6\.2\.1$/;
+  const pessimisticVersionRegex = /^~> 6\.0$/;
+
+  if (
+    !exactVersionRegex.test(providerVersion) &&
+    !pessimisticVersionRegex.test(providerVersion)
+  ) {
+    return {
+      decision: "reject",
+      reason: "UNPINNED_PROVIDER"
+    };
+  }
+
+  // 5. Required labels
+  const requiredLabels = {
+    owner: "student-mr4a3",
+    environment: "production",
+    cost_center: "cc-eq4q"
+  };
+
+  for (const [key, value] of Object.entries(requiredLabels)) {
+    if (resource.labels[key] !== value) {
+      return {
+        decision: "reject",
+        reason: "MISSING_LABELS"
+      };
+    }
+  }
+
+  // 6. Secret must be null or secret:// reference
+  if (
+    resource.secret !== null &&
+    !/^secret:\/\/.+/.test(resource.secret)
+  ) {
+    return {
+      decision: "reject",
+      reason: "PLAINTEXT_SECRET"
+    };
+  }
+
+  // 7. Stateful delete approval
+  const statefulTypes = [
+    "storage_bucket",
+    "sql_database",
+    "persistent_disk"
+  ];
+
+  if (
+    resource.action === "delete" &&
+    statefulTypes.includes(resource.type) &&
+    destroyApproved !== true
+  ) {
+    return {
+      decision: "reject",
+      reason: "DELETE_NOT_APPROVED"
+    };
+  }
+
+  // 8. Production storage bucket forceDestroy
+  if (
+    resource.type === "storage_bucket" &&
+    resource.forceDestroy === true
+  ) {
+    return {
+      decision: "reject",
+      reason: "FORCE_DESTROY"
+    };
+  }
+
+  return {
+    decision: "approve",
+    reason: "APPROVE"
+  };
+}
+
+app.post("/terraform/plan", (req, res) => {
+  res.json(evaluateTerraformPlan(req.body));
+});
+
 export default app;
